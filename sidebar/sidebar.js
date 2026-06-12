@@ -2,9 +2,6 @@ const refreshBtn = document.getElementById("refresh-btn");
 const episodeCountEl = document.getElementById("episode-count");
 const episodeInfoEl = document.getElementById("episode-info");
 const enableSwitch = document.getElementById("enable-switch");
-const urlToggle = document.getElementById("url-toggle");
-const urlPanel = document.getElementById("url-panel");
-const domainInput = document.getElementById("domain-input");
 const statusMsg = document.getElementById("status-msg");
 const overlay = document.getElementById("overlay");
 const bootOverlay = document.getElementById("boot-overlay");
@@ -13,7 +10,7 @@ const panel = document.querySelector(".panel");
 let suppressSwitchEvent = false;
 let popupClosing = false;
 let loadUiPromise = null;
-let initialBootDone = false;
+let currentTabId = null;
 
 function showOverlay() {
   panel.classList.add("busy");
@@ -25,18 +22,48 @@ function hideOverlay() {
   overlay.classList.add("hidden");
 }
 
+function finishBootOverlay() {
+  if (bootOverlay) {
+    bootOverlay.classList.add("hidden");
+  }
+}
+
 const MIN_OVERLAY_MS = 600;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function getActiveTab() {
+  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  return tabs[0] || null;
+}
+
 async function readStorage() {
-  return browser.storage.local.get(["enabled", "domain", "episodes", "episodeCount"]);
+  const tab = await getActiveTab();
+  currentTabId = tab?.id ?? null;
+
+  if (currentTabId == null) {
+    return defaultTabState();
+  }
+
+  return getTabState(currentTabId);
+}
+
+async function renderFromRefreshResponse(response) {
+  if (response?.ok && !response.error) {
+    render({
+      enabled: Boolean(response.enabled ?? enableSwitch.checked),
+      episodes: response.episodes || [],
+      episodeCount: Number(response.episodeCount ?? response.episodes?.length ?? 0),
+    });
+    return;
+  }
+  render(await readStorage());
 }
 
 function isPluginEnabled(state) {
-  return Boolean(state.enabled && state.domain);
+  return Boolean(state.enabled);
 }
 
 function render(state) {
@@ -45,7 +72,6 @@ function render(state) {
 
   suppressSwitchEvent = true;
   enableSwitch.checked = Boolean(state.enabled);
-  domainInput.value = state.domain || "";
   suppressSwitchEvent = false;
 
   refreshBtn.disabled = !active;
@@ -66,8 +92,6 @@ function loadUi() {
     return loadUiPromise;
   }
 
-  const isInitialBoot = !initialBootDone;
-
   loadUiPromise = (async () => {
     try {
       render(await readStorage());
@@ -75,10 +99,7 @@ function loadUi() {
       vapLogError("popup", error, { action: "loadUi" });
       console.error("[Videos Auto Play] failed to load popup state", error);
     } finally {
-      if (isInitialBoot && bootOverlay) {
-        bootOverlay.classList.add("hidden");
-        initialBootDone = true;
-      }
+      finishBootOverlay();
       loadUiPromise = null;
     }
   })();
@@ -86,23 +107,31 @@ function loadUi() {
   return loadUiPromise;
 }
 
-async function persistSettings(enabled, domain) {
-  const prev = await readStorage();
-
-  if (!enabled) {
-    await browser.storage.local.set({ enabled: false });
-    vapLog.info("plugin", "disabled from popup");
-    return readStorage();
+async function persistSettings(enabled) {
+  const tab = await getActiveTab();
+  if (tab?.id == null) {
+    return defaultTabState();
   }
 
-  const nextDomain = normalizeDomain(domain) || prev.domain || "";
-  if (!nextDomain) {
-    return prev;
+  currentTabId = tab.id;
+  const prev = await getTabState(tab.id);
+
+  if (!enabled) {
+    await setTabState(tab.id, {
+      enabled: false,
+      episodes: [],
+      episodeCount: 0,
+    });
+    await browser.runtime.sendMessage({
+      type: "TAB_DISABLED",
+      tabId: tab.id,
+    });
+    vapLog.info("plugin", "disabled from popup", null, { tabId: tab.id });
+    return getTabState(tab.id);
   }
 
   const patch = {
     enabled: true,
-    domain: nextDomain,
   };
 
   if (!prev.enabled) {
@@ -110,9 +139,9 @@ async function persistSettings(enabled, domain) {
     patch.episodeCount = 0;
   }
 
-  await browser.storage.local.set(patch);
-  vapLog.info("plugin", "enabled from popup", { domain: nextDomain });
-  return readStorage();
+  await setTabState(tab.id, patch);
+  vapLog.info("plugin", "enabled from popup", null, { tabId: tab.id });
+  return getTabState(tab.id);
 }
 
 async function runScan(task) {
@@ -142,82 +171,63 @@ enableSwitch.addEventListener("change", async () => {
   if (suppressSwitchEvent || popupClosing) return;
 
   const enabled = enableSwitch.checked;
-  const domain = normalizeDomain(domainInput.value);
-
-  if (enabled && !domain) {
-    suppressSwitchEvent = true;
-    enableSwitch.checked = false;
-    suppressSwitchEvent = false;
-    return;
-  }
-
-  const state = await persistSettings(enabled, domain);
+  const state = await persistSettings(enabled);
   render(state);
 
   if (enabled) {
     await runScan(async () => {
-      const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+      const tab = await getActiveTab();
+      currentTabId = tab?.id ?? currentTabId;
+      const response = await browser.runtime.sendMessage({
+        type: "REFRESH_EPISODES",
+        tabId: currentTabId,
+      });
       if (response?.error) {
-        vapLog.warn("scan", "refresh response error", response);
+        vapLog.warn("scan", "refresh response error", response, { tabId: currentTabId });
       }
-      render(await readStorage());
+      await renderFromRefreshResponse(response);
     }).catch((error) => {
-      vapLogError("scan", error, { action: "enable-switch" });
-    });
-  }
-});
-
-domainInput.addEventListener("keydown", async (event) => {
-  if (event.key !== "Enter" || popupClosing) return;
-  event.preventDefault();
-
-  const domain = normalizeDomain(domainInput.value);
-  if (!domain) return;
-
-  const state = await persistSettings(enableSwitch.checked, domain);
-  render(state);
-
-  if (enableSwitch.checked) {
-    await runScan(async () => {
-      const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
-      if (response?.error) {
-        vapLog.warn("scan", "refresh response error", response);
-      }
-      render(await readStorage());
-    }).catch((error) => {
-      vapLogError("scan", error, { action: "domain-enter" });
+      vapLogError("scan", error, { action: "enable-switch" }, { tabId: currentTabId });
     });
   }
 });
 
 refreshBtn.addEventListener("click", async () => {
   await runScan(async () => {
-    const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+    const tab = await getActiveTab();
+    currentTabId = tab?.id ?? currentTabId;
+    const response = await browser.runtime.sendMessage({
+      type: "REFRESH_EPISODES",
+      tabId: currentTabId,
+    });
     if (response?.error) {
-      vapLog.warn("scan", "refresh response error", response);
+      vapLog.warn("scan", "refresh response error", response, { tabId: currentTabId });
     }
-    render(await readStorage());
+    await renderFromRefreshResponse(response);
   }).catch((error) => {
-    vapLogError("scan", error, { action: "refresh-button" });
+    vapLogError("scan", error, { action: "refresh-button" }, { tabId: currentTabId });
   });
 });
 
-urlToggle.addEventListener("click", () => {
-  urlPanel.classList.toggle("hidden");
-  urlToggle.classList.toggle("open");
-});
+function storageChangeAffectsCurrentTab(changes) {
+  if (currentTabId == null) return false;
+  const key = tabStateKey(currentTabId);
+  return Object.prototype.hasOwnProperty.call(changes, key);
+}
 
 browser.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") return;
-  if (changes.enabled || changes.domain || changes.episodes || changes.episodeCount) {
+  if (storageChangeAffectsCurrentTab(changes)) {
     loadUi();
   }
 });
 
 browser.runtime.onMessage.addListener((message) => {
-  if (message.type === "EPISODES_SCANNED") {
-    loadUi();
-  }
+  if (message.type !== "EPISODES_SCANNED") return;
+  if (message.tabId == null || currentTabId == null) return;
+  if (message.tabId !== currentTabId) return;
+  loadUi();
 });
 
+setTimeout(finishBootOverlay, 3000);
 loadUi();

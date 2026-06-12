@@ -116,6 +116,7 @@ body {
   width: 42px;
   height: 24px;
   flex-shrink: 0;
+  margin-left: auto;
 }
 
 .switch input {
@@ -151,47 +152,6 @@ body {
 
 .switch input:checked + .slider::before {
   transform: translateX(18px);
-}
-
-.url-toggle {
-  margin-left: auto;
-}
-
-.arrow {
-  font-size: 10px;
-  transition: transform 0.2s;
-}
-
-.url-toggle.open .arrow {
-  transform: rotate(180deg);
-}
-
-.url-panel {
-  margin-top: 10px;
-  width: 100%;
-  min-width: 0;
-}
-
-.url-panel.hidden {
-  display: none;
-}
-
-.url-panel input {
-  display: block;
-  width: 100%;
-  max-width: 100%;
-  min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text);
-  font: inherit;
-}
-
-.url-panel input:focus {
-  outline: none;
-  border-color: var(--accent);
 }
 
 .episode-info {
@@ -276,7 +236,6 @@ body {
 }
 
 .panel.busy .toolbar,
-.panel.busy .url-panel,
 .panel.busy .status-msg {
   pointer-events: none;
 }

@@ -24,22 +24,7 @@
           <input id="enable-switch" type="checkbox" />
           <span class="slider"></span>
         </label>
-
-        <button id="url-toggle" type="button" class="btn url-toggle">
-          <span>URL</span>
-          <span id="url-arrow" class="arrow">▼</span>
-        </button>
       </header>
-
-      <section id="url-panel" class="url-panel hidden">
-        <input
-          id="domain-input"
-          type="text"
-          placeholder="example.com"
-          spellcheck="false"
-          autocomplete="off"
-        />
-      </section>
 
       <div id="episode-info" class="episode-info hidden">
         <span class="episode-info-label">剧集数量</span>
@@ -56,7 +41,7 @@
       </div>
     </div>
 
-    <script src="../lib/domain.js"></script>
+    <script src="../lib/tab-state.js"></script>
     <script src="../lib/log-client.js"></script>
     <script src="sidebar.js"></script>
   </body>

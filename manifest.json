@@ -20,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["lib/domain.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
+      "js": ["lib/tab-state.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
       "run_at": "document_idle"
     }
   ],

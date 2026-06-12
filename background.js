@@ -1,28 +1,26 @@
-importScripts("lib/domain.js", "lib/logger.js");
+importScripts("lib/tab-state.js", "lib/logger.js");
 
 const autoPlayJobs = new Map();
 const endMonitors = new Map();
 
 const END_MIN_PLAY_MS = 12000;
 const END_SILENT_CHECKS = 3;
-const END_POLL_MS = 2000;
+const END_POLL_MS = 4000;
 const AUTO_PLAY_ATTEMPTS = 10;
 const AUTO_PLAY_INTERVAL_MS = 1500;
 
-async function getState() {
-  return browser.storage.local.get(["enabled", "domain", "episodes", "episodeCount"]);
-}
-
 async function saveEpisodes(episodes, tabId) {
-  await browser.storage.local.set({
+  if (tabId == null) return;
+
+  await setTabState(tabId, {
     episodes,
     episodeCount: episodes.length,
-    activeTabId: tabId ?? null,
   });
 
   browser.runtime
     .sendMessage({
       type: "EPISODES_SCANNED",
+      tabId,
       episodes,
       episodeCount: episodes.length,
     })
@@ -69,7 +67,7 @@ async function ensureContentScript(tabId) {
   try {
     await browser.scripting.executeScript({
       target: { tabId },
-      files: ["lib/domain.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
+      files: ["lib/tab-state.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
     });
   } catch (error) {
     void vapLogError("content-script", error, { action: "inject" }, { tabId, url: tab.url });
@@ -86,8 +84,12 @@ async function ensureContentScript(tabId) {
 async function requestScan(tabId, rediscover = false) {
   try {
     await ensureContentScript(tabId);
-    const response = await sendToTab(tabId, { type: "SCAN_EPISODES", rediscover });
-    const episodes = response?.episodes || [];
+    const response = await sendToTab(tabId, { type: "SCAN_EPISODES", rediscover, tabId });
+    if (!response) {
+      void vapLog.warn("scan", "no response from content script", { rediscover }, { tabId });
+      return [];
+    }
+    const episodes = response.episodes || [];
     void vapLog.info(
       "scan",
       rediscover ? "manual scan finished" : "scan finished",
@@ -112,6 +114,12 @@ function tabCaptureKey(tabId) {
 async function getAutoPlayState(tabId) {
   const data = await browser.storage.local.get(autoPlayKey(tabId));
   return data[autoPlayKey(tabId)] || null;
+}
+
+async function isTabEnabled(tabId) {
+  if (tabId == null) return false;
+  const state = await getTabState(tabId);
+  return Boolean(state.enabled);
 }
 
 function cancelAutoPlayJob(tabId) {
@@ -209,6 +217,7 @@ async function clickIframePlayer(tabId, capture) {
 async function triggerAutoPlayForTab(tabId) {
   const state = await getAutoPlayState(tabId);
   if (!state?.pending) return;
+  if (!(await isTabEnabled(tabId))) return;
 
   if (autoPlayJobs.has(tabId)) return;
 
@@ -285,10 +294,11 @@ async function triggerAutoPlayForTab(tabId) {
 }
 
 async function startEndMonitor(tabId) {
+  if (endMonitors.has(tabId)) return;
+
   stopEndMonitor(tabId);
 
-  const enabledState = await getState();
-  if (!enabledState.enabled) return;
+  if (!(await isTabEnabled(tabId))) return;
 
   const capture =
     (await browser.storage.local.get(tabCaptureKey(tabId)))[tabCaptureKey(tabId)] || {};
@@ -296,8 +306,8 @@ async function startEndMonitor(tabId) {
     return;
   }
 
-  const episodesState = await getState();
-  if (!Array.isArray(episodesState.episodes) || episodesState.episodes.length === 0) {
+  const tabState = await getTabState(tabId);
+  if (!Array.isArray(tabState.episodes) || tabState.episodes.length === 0) {
     return;
   }
 
@@ -318,8 +328,7 @@ async function startEndMonitor(tabId) {
         return;
       }
 
-      const enabledNow = await getState();
-      if (!enabledNow.enabled) {
+      if (!(await isTabEnabled(tabId))) {
         stopEndMonitor(tabId);
         return;
       }
@@ -359,52 +368,25 @@ async function startEndMonitor(tabId) {
 }
 
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
   void (async () => {
-    if (changeInfo.status === "complete") {
+    try {
       const state = await getAutoPlayState(tabId);
       if (state?.pending) {
-        try {
-          await triggerAutoPlayForTab(tabId);
-        } catch (error) {
-          void vapLogError("autoplay", error, { phase: "tab-complete" }, { tabId });
-          cancelAutoPlayJob(tabId);
-        }
+        await triggerAutoPlayForTab(tabId);
       }
+    } catch (error) {
+      void vapLogError("autoplay", error, { phase: "tab-complete" }, { tabId });
+      cancelAutoPlayJob(tabId);
     }
-
-    if (changeInfo.audible === false && endMonitors.has(tabId)) {
-      const monitor = endMonitors.get(tabId);
-      if (monitor?.wasAudible) {
-        void (async () => {
-          try {
-            if (monitor.cancel) return;
-            const pending = await getAutoPlayState(tabId);
-            if (!pending?.pending) {
-              const now = Date.now();
-              monitor.silentChecks += 1;
-              const playedMs = now - monitor.audibleSince;
-              if (playedMs >= END_MIN_PLAY_MS && monitor.silentChecks >= END_SILENT_CHECKS) {
-                stopEndMonitor(tabId);
-                await sendToTab(tabId, { type: "PLAY_NEXT_EPISODE" });
-              }
-            }
-          } catch (error) {
-            void vapLogError("end-monitor", error, { phase: "audible-change" }, { tabId });
-            stopEndMonitor(tabId);
-          }
-        })();
-      }
-    }
-  })().catch((error) => {
-    void vapLogError("tabs", error, { phase: "onUpdated" }, { tabId });
-    stopAllTabJobs(tabId);
-  });
+  })();
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
   stopAllTabJobs(tabId);
   browser.storage.local.remove(autoPlayKey(tabId)).catch(() => {});
   browser.storage.local.remove(tabCaptureKey(tabId)).catch(() => {});
+  clearTabState(tabId).catch(() => {});
 });
 
 if (browser.runtime.onSuspend) {
@@ -417,18 +399,12 @@ browser.runtime.onStartup.addListener(() => {
   stopAllBackgroundJobs();
   void vapLog.info("lifecycle", "browser startup, plugin state reset");
 
-  browser.storage.local
-    .set({
-      enabled: false,
-      domain: "",
-      episodes: [],
-      episodeCount: 0,
-    })
-    .catch(() => {});
-
   browser.storage.local.get(null).then((all) => {
     const keys = Object.keys(all).filter(
-      (key) => key.startsWith("vapAutoPlay_") || key.startsWith("vapCapture_")
+      (key) =>
+        isTabStorageKey(key) ||
+        key.startsWith("vapAutoPlay_") ||
+        key.startsWith("vapCapture_")
     );
     if (keys.length) {
       browser.storage.local.remove(keys).catch(() => {});
@@ -437,12 +413,17 @@ browser.runtime.onStartup.addListener(() => {
 });
 
 browser.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local" || !changes.enabled) return;
-  if (changes.enabled.newValue === false) {
-    stopAllBackgroundJobs();
-    void vapLog.info("plugin", "disabled by storage change");
-  } else if (changes.enabled.newValue === true) {
-    void vapLog.info("plugin", "enabled by storage change");
+  if (areaName !== "local") return;
+
+  for (const key of Object.keys(changes)) {
+    if (!isTabStorageKey(key)) continue;
+    const tabId = tabIdFromStorageKey(key);
+    if (tabId == null) continue;
+
+    const next = changes[key]?.newValue;
+    if (next && next.enabled === false) {
+      stopAllTabJobs(tabId);
+    }
   }
 });
 
@@ -451,7 +432,12 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       switch (message.type) {
         case "GET_STATE": {
-          sendResponse(await getState());
+          const tabId = message.tabId ?? sender.tab?.id;
+          if (tabId == null) {
+            sendResponse(defaultTabState());
+            break;
+          }
+          sendResponse(await getTabState(tabId));
           break;
         }
 
@@ -459,18 +445,29 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           const tab = await getActiveTab(message);
           if (!tab?.id) {
             void vapLog.warn("scan", "refresh failed: no active tab");
-            sendResponse({ ok: false, ...(await getState()) });
+            sendResponse({ ok: false, ...defaultTabState() });
             break;
           }
           const episodes = await requestScan(tab.id, true);
           await saveEpisodes(episodes, tab.id);
-          sendResponse({ ok: true, ...(await getState()) });
+          sendResponse({ ok: true, ...(await getTabState(tab.id)) });
           break;
         }
 
         case "EPISODES_UPDATED": {
+          const tabId = sender.tab?.id;
           const episodes = message.episodes || [];
-          await saveEpisodes(episodes, sender.tab?.id);
+          await saveEpisodes(episodes, tabId);
+          sendResponse({ ok: true });
+          break;
+        }
+
+        case "TAB_DISABLED": {
+          const tabId = message.tabId ?? sender.tab?.id;
+          if (tabId != null) {
+            stopAllTabJobs(tabId);
+            await sendToTab(tabId, { type: "TAB_DISABLED" }).catch(() => {});
+          }
           sendResponse({ ok: true });
           break;
         }

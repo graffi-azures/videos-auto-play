@@ -15,7 +15,7 @@
     autoPlay: "__vapAutoPlay",
   };
 
-  const IFRAME_OBSERVER_MAX_MS = 45000;
+  const IFRAME_AUTOPLAY_RETRY_DELAYS_MS = [2000, 5000];
 
   const EPISODE_LINK_CLASS_PATTERN =
     /(?:playlist|play-list|play_list|play-list|ep-?list|eplist|episode|num-?list|serial|series|选集|剧集|分集|集数|ju-?list|sortlist)/i;
@@ -71,15 +71,17 @@
   }
 
   let enabled = false;
-  let domain = "";
   let episodes = [];
+  let currentTabId = null;
   let autoPlayPending = false;
   let tabStateReady = false;
   let savedClickPoint = null;
   let savedIframeIndex = -1;
-  let iframeObserverStopTimer = null;
+  let iframeAutoPlayTimers = [];
   let bootstrapDelayTimer = null;
   let bootstrapRunId = 0;
+  let autoPlayRequested = false;
+  let endMonitorActive = false;
   const boundIframes = new WeakSet();
   let settingsReady = false;
   let settingsReadyPromise = null;
@@ -88,13 +90,41 @@
     return `vapCapture_${tabId}`;
   }
 
-  async function getCurrentTabId() {
+  async function getCurrentTabId(preferredTabId) {
+    if (preferredTabId != null) {
+      currentTabId = preferredTabId;
+      return preferredTabId;
+    }
+    if (currentTabId != null) return currentTabId;
     try {
       const tab = await browser.tabs.getCurrent();
-      return tab?.id ?? null;
+      currentTabId = tab?.id ?? null;
+      return currentTabId;
     } catch {
       return null;
     }
+  }
+
+  async function loadTabSettingsFromStorage(preferredTabId) {
+    const tabId = await getCurrentTabId(preferredTabId);
+    if (tabId == null) {
+      enabled = false;
+      episodes = [];
+      return false;
+    }
+
+    const state = await getTabState(tabId);
+    enabled = Boolean(state.enabled);
+    episodes = Array.isArray(state.episodes) ? state.episodes : [];
+    return enabled;
+  }
+
+  async function syncTabSettingsFromStorage(preferredTabId) {
+    settingsReady = false;
+    settingsReadyPromise = null;
+    await loadTabSettingsFromStorage(preferredTabId);
+    settingsReady = true;
+    return enabled;
   }
 
   async function persistTabCapture(patch) {
@@ -160,11 +190,11 @@
     // auto-play retries run in the background service worker
   }
 
-  function stopIframeObserver() {
-    if (iframeObserverStopTimer != null) {
-      clearTimeout(iframeObserverStopTimer);
-      iframeObserverStopTimer = null;
+  function stopIframeAutoPlayWatch() {
+    for (const timer of iframeAutoPlayTimers) {
+      clearTimeout(timer);
     }
+    iframeAutoPlayTimers = [];
     if (window.__vapIframeObserver) {
       window.__vapIframeObserver.disconnect();
       window.__vapIframeObserver = null;
@@ -172,6 +202,8 @@
   }
 
   async function stopBackgroundEndMonitor() {
+    if (!endMonitorActive) return;
+    endMonitorActive = false;
     try {
       await browser.runtime.sendMessage({ type: "STOP_END_MONITOR" });
     } catch (error) {
@@ -180,28 +212,32 @@
   }
 
   async function startBackgroundEndMonitor() {
-    if (!isRunning() || !pageHasIframePlayer()) return;
+    if (endMonitorActive || !isActiveOnPage() || !pageHasIframePlayer()) return;
     try {
       await browser.runtime.sendMessage({ type: "START_END_MONITOR" });
-      vapLog.info("end-monitor", "started background end monitor");
+      endMonitorActive = true;
     } catch (error) {
       vapLogError("end-monitor", error, { action: "start" });
     }
   }
 
   async function requestBackgroundAutoPlay() {
+    if (autoPlayRequested) return;
+    autoPlayRequested = true;
     try {
       await browser.runtime.sendMessage({ type: "REQUEST_AUTO_PLAY" });
-      vapLog.info("autoplay", "requested background auto play");
     } catch (error) {
+      autoPlayRequested = false;
       vapLogError("autoplay", error, { action: "request" });
     }
   }
 
   function stopAllMonitors() {
     bootstrapRunId += 1;
+    autoPlayRequested = false;
+    endMonitorActive = false;
     stopAutoPlayRetry();
-    stopIframeObserver();
+    stopIframeAutoPlayWatch();
     clearBootstrapDelayTimer();
     void stopBackgroundEndMonitor();
   }
@@ -403,14 +439,13 @@
     return root === document || root.contains(element);
   }
 
-  function isRunning() {
-    return Boolean(enabled && domain);
+  function isActiveOnPage() {
+    return Boolean(enabled);
   }
 
-  function loadPluginSettings(data, options = {}) {
-    enabled = Boolean(data.enabled);
-    domain = data.domain || "";
-    episodes = Array.isArray(data.episodes) ? data.episodes : [];
+  function loadPluginSettings(state, options = {}) {
+    enabled = Boolean(state.enabled);
+    episodes = Array.isArray(state.episodes) ? state.episodes : [];
 
     if (!enabled) {
       clearSessionCaptures();
@@ -434,17 +469,22 @@
     }
 
     settingsReadyPromise = (async () => {
-      const data = await browser.storage.local.get([
-        "enabled",
-        "domain",
-        "episodes",
-        "episodeCount",
-      ]);
-      loadPluginSettings(data);
+      await loadTabSettingsFromStorage();
       settingsReady = true;
     })();
 
     await settingsReadyPromise;
+  }
+
+  async function reloadTabSettings(options = {}, preferredTabId) {
+    await syncTabSettingsFromStorage(preferredTabId);
+    return loadPluginSettings(
+      {
+        enabled,
+        episodes,
+      },
+      options
+    );
   }
 
   function sessionGet(key) {
@@ -686,13 +726,12 @@
   }
 
   function autoScanAndPublish(options = {}) {
-    if (!isRunning()) return episodes;
+    if (!isActiveOnPage()) return episodes;
 
     const list = scanEpisodes(options);
     if (list.length > 0) {
       publishEpisodes(list);
       void maybeStartEndMonitor();
-      vapLog.info("scan", "episode list updated on page", { count: list.length });
     } else if (options.rediscover) {
       vapLog.warn("scan", "no episode list found on page");
     }
@@ -701,10 +740,20 @@
 
   function publishEpisodes(list) {
     episodes = list;
-    browser.storage.local.set({
-      episodes: list,
-      episodeCount: list.length,
-    });
+    void (async () => {
+      const tabId = await getCurrentTabId();
+      if (tabId == null) return;
+      await setTabState(tabId, {
+        episodes: list,
+        episodeCount: list.length,
+      });
+    })();
+    void browser.runtime
+      .sendMessage({
+        type: "EPISODES_UPDATED",
+        episodes: list,
+      })
+      .catch(() => {});
   }
 
   function rescanAndPublish() {
@@ -795,7 +844,7 @@
 
   async function maybeStartEndMonitor() {
     await ensureSettingsLoaded();
-    if (!isRunning() || !pageHasIframePlayer() || shouldAutoPlay()) return;
+    if (!isActiveOnPage() || !pageHasIframePlayer() || shouldAutoPlay()) return;
     if (episodes.length === 0) {
       await refreshEpisodesFromStorage();
     }
@@ -876,9 +925,11 @@
 
   async function refreshEpisodesFromStorage() {
     try {
-      const data = await browser.storage.local.get(["episodes"]);
-      if (Array.isArray(data.episodes) && data.episodes.length > 0) {
-        episodes = data.episodes;
+      const tabId = await getCurrentTabId();
+      if (tabId == null) return;
+      const state = await getTabState(tabId);
+      if (Array.isArray(state.episodes) && state.episodes.length > 0) {
+        episodes = state.episodes;
       }
     } catch {
       // ignore
@@ -887,7 +938,7 @@
 
   async function playNextEpisode() {
     await ensureSettingsLoaded();
-    if (!isRunning() || !pageHasIframePlayer()) return;
+    if (!isActiveOnPage() || !pageHasIframePlayer()) return;
 
     await refreshEpisodesFromStorage();
     if (episodes.length === 0) return;
@@ -903,7 +954,6 @@
     }
 
     const nextUrl = episodes[index + 1].url;
-    vapLog.info("autoplay", "navigating to next episode", { index: index + 1, nextUrl });
     await stopBackgroundEndMonitor();
     await markAutoPlayPending(nextUrl);
     location.href = nextUrl;
@@ -912,7 +962,7 @@
   function startAutoPlayRetry() {
     void (async () => {
       await ensureSettingsLoaded();
-      if (!isRunning() || !shouldAutoPlay() || !pageHasIframePlayer()) return;
+      if (!isActiveOnPage() || !shouldAutoPlay() || !pageHasIframePlayer()) return;
       void requestBackgroundAutoPlay();
     })();
   }
@@ -928,61 +978,53 @@
   }
 
   function observeIframesForAutoPlay() {
-    if (!shouldAutoPlay()) {
-      stopIframeObserver();
-      return;
-    }
+    stopIframeAutoPlayWatch();
+    if (!shouldAutoPlay() || !isActiveOnPage()) return;
 
     playerPlay().findLargeIframes().forEach(bindIframe);
+    void requestBackgroundAutoPlay();
 
-    stopIframeObserver();
-    window.__vapIframeObserver = new MutationObserver(() => {
-      if (!shouldAutoPlay()) {
-        stopIframeObserver();
-        return;
-      }
-      playerPlay().findLargeIframes().forEach(bindIframe);
-      void requestBackgroundAutoPlay();
-    });
-    window.__vapIframeObserver.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
-
-    iframeObserverStopTimer = setTimeout(() => {
-      stopIframeObserver();
-    }, IFRAME_OBSERVER_MAX_MS);
+    for (const delay of IFRAME_AUTOPLAY_RETRY_DELAYS_MS) {
+      const timer = setTimeout(() => {
+        if (!shouldAutoPlay() || !isActiveOnPage()) {
+          stopIframeAutoPlayWatch();
+          return;
+        }
+        playerPlay().findLargeIframes().forEach(bindIframe);
+      }, delay);
+      iframeAutoPlayTimers.push(timer);
+    }
   }
 
   function handleEpisodeCapture(event) {
     void (async () => {
       await ensureSettingsLoaded();
-      if (!isRunning()) return;
+      if (!isActiveOnPage()) return;
 
-    const target = event.target;
-    if (!(target instanceof Element)) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
 
-    const anchor = target.closest("a[href]");
-    if (!isEpisodeAnchor(anchor)) return;
+      const anchor = target.closest("a[href]");
+      if (!isEpisodeAnchor(anchor)) return;
 
-    const list = captureEpisodeList(anchor);
-    if (list.length > 0) {
-      publishEpisodes(list);
-      void maybeStartEndMonitor();
-    }
+      const list = captureEpisodeList(anchor);
+      if (list.length > 0) {
+        publishEpisodes(list);
+        void maybeStartEndMonitor();
+      }
     })();
   }
 
   function handlePlayerCapture(event) {
     void (async () => {
       await ensureSettingsLoaded();
-      if (!isRunning()) return;
+      if (!isActiveOnPage()) return;
 
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    if (!isPlayerRelatedElement(target)) return;
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (!isPlayerRelatedElement(target)) return;
 
-    savePlayerTarget(target, event);
+      savePlayerTarget(target, event);
     })();
   }
 
@@ -1004,7 +1046,7 @@
         await restoreTabState();
       }
 
-      if (!isRunning()) return;
+      if (!isActiveOnPage()) return;
 
       autoScanAndPublish({ rediscover: false });
 
@@ -1025,21 +1067,27 @@
     }
   }
 
-  function applyStorage(data, options = {}) {
-    settingsReady = true;
+  function applyTabStorage(options = {}) {
     const wasEnabled = enabled;
-    const active = loadPluginSettings(data, options);
+    const active = loadPluginSettings(
+      {
+        enabled,
+        episodes,
+      },
+      options
+    );
+
     if (!active) {
-      if (wasEnabled || data.enabled === false) {
-        vapLog.info("plugin", "plugin inactive on page", { enabled: false, domain: data.domain || "" });
+      if (wasEnabled || !enabled) {
+        vapLog.info("plugin", "plugin inactive on tab", { enabled: false });
       }
       return;
     }
 
     if (options.resetCaptures) {
-      vapLog.info("plugin", "plugin enabled, captures reset");
+      vapLog.info("plugin", "plugin enabled on tab, captures reset");
     } else if (!wasEnabled && enabled) {
-      vapLog.info("plugin", "plugin active on page", { domain });
+      vapLog.info("plugin", "plugin active on tab");
     }
 
     setupClickCapture();
@@ -1048,36 +1096,65 @@
 
   browser.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
-    if (!changes.enabled && !changes.domain && !changes.episodes && !changes.episodeCount) return;
 
-    const resetCaptures =
-      changes.enabled?.newValue === true && changes.enabled?.oldValue === false;
+    void (async () => {
+      const tabId = await getCurrentTabId();
+      if (tabId == null) return;
 
-    browser.storage.local
-      .get(["enabled", "domain", "episodes", "episodeCount"])
-      .then((data) => {
-        applyStorage(data, { resetCaptures });
-      });
+      const key = tabStateKey(tabId);
+      if (!Object.prototype.hasOwnProperty.call(changes, key)) return;
+
+      const next = { ...defaultTabState(), ...(changes[key]?.newValue || {}) };
+      const prev = { ...defaultTabState(), ...(changes[key]?.oldValue || {}) };
+
+      if (next.enabled !== prev.enabled) {
+        const resetCaptures = next.enabled === true && prev.enabled !== true;
+        stopAllMonitors();
+        settingsReady = false;
+        settingsReadyPromise = null;
+        await reloadTabSettings({ resetCaptures });
+        applyTabStorage({ resetCaptures });
+        return;
+      }
+
+      enabled = Boolean(next.enabled);
+      episodes = Array.isArray(next.episodes) ? next.episodes : [];
+
+      if (!enabled) {
+        stopAllMonitors();
+      }
+    })();
   });
 
-  browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case "PING":
         sendResponse({ ok: true });
         break;
       case "SCAN_EPISODES": {
-        const list = scanEpisodes({ rediscover: Boolean(message.rediscover) });
-        if (list.length > 0) {
-          publishEpisodes(list);
-          void maybeStartEndMonitor();
-        }
-        sendResponse({ episodes: list, episodeCount: list.length });
+        void (async () => {
+          const tabId = message.tabId ?? sender.tab?.id ?? null;
+          await syncTabSettingsFromStorage(tabId);
+
+          if (!enabled) {
+            sendResponse({ episodes: [], episodeCount: 0 });
+            return;
+          }
+
+          const list = scanEpisodes({ rediscover: Boolean(message.rediscover) });
+          if (list.length > 0) {
+            publishEpisodes(list);
+            void maybeStartEndMonitor();
+          }
+          sendResponse({ episodes: list, episodeCount: list.length });
+        })();
         break;
       }
       case "AUTO_PLAY_NOW":
         void (async () => {
           await ensureSettingsLoaded();
-          if (isRunning() && shouldAutoPlay() && pageHasIframePlayer()) {
+          if (isActiveOnPage() && shouldAutoPlay() && pageHasIframePlayer()) {
+            autoPlayRequested = false;
             observeIframesForAutoPlay();
             startAutoPlayRetry();
           }
@@ -1087,19 +1164,29 @@
       case "AUTO_PLAY_SUCCEEDED":
         void clearAutoPlayPending();
         stopAutoPlayRetry();
-        stopIframeObserver();
+        stopIframeAutoPlayWatch();
         void maybeStartEndMonitor();
         sendResponse({ ok: true });
         break;
       case "AUTO_PLAY_FAILED":
         void clearAutoPlayPending();
+        autoPlayRequested = false;
         stopAutoPlayRetry();
-        stopIframeObserver();
+        stopIframeAutoPlayWatch();
         void maybeStartEndMonitor();
         sendResponse({ ok: true });
         break;
       case "PLAY_NEXT_EPISODE":
         void playNextEpisode();
+        sendResponse({ ok: true });
+        break;
+      case "TAB_DISABLED":
+        stopAllMonitors();
+        settingsReady = false;
+        settingsReadyPromise = null;
+        void reloadTabSettings().then(() => {
+          clearSessionCaptures();
+        });
         sendResponse({ ok: true });
         break;
       default:
@@ -1112,7 +1199,7 @@
     try {
       await restoreTabState();
       await ensureSettingsLoaded();
-      if (isRunning()) {
+      if (isActiveOnPage()) {
         setupClickCapture();
       }
     } catch (error) {
@@ -1131,9 +1218,11 @@
         settingsReady = false;
         settingsReadyPromise = null;
         await ensureSettingsLoaded();
-        if (isRunning()) {
+        if (isActiveOnPage()) {
           setupClickCapture();
           await bootstrapPlayback();
+        } else {
+          stopAllMonitors();
         }
       } catch (error) {
         vapLogError("page", error, { phase: "pageshow" });
