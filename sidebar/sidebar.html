@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Videos Auto Play</title>
+    <link rel="stylesheet" href="sidebar.css" />
+  </head>
+  <body>
+    <div id="boot-overlay" class="boot-overlay" aria-live="polite">
+      <div class="boot-overlay-box">
+        <div class="spinner"></div>
+        <span>加载中…</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <header class="toolbar">
+        <button id="refresh-btn" type="button" class="btn refresh-btn" title="重新读取剧集列表">
+          <span class="btn-icon">↻</span>
+        </button>
+
+        <label class="switch" title="启用 / 停用">
+          <input id="enable-switch" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+
+        <button id="url-toggle" type="button" class="btn url-toggle">
+          <span>URL</span>
+          <span id="url-arrow" class="arrow">▼</span>
+        </button>
+      </header>
+
+      <section id="url-panel" class="url-panel hidden">
+        <input
+          id="domain-input"
+          type="text"
+          placeholder="example.com"
+          spellcheck="false"
+          autocomplete="off"
+        />
+      </section>
+
+      <div id="episode-info" class="episode-info hidden">
+        <span class="episode-info-label">剧集数量</span>
+        <span id="episode-count" class="episode-count">0</span>
+      </div>
+
+      <p id="status-msg" class="status-msg hidden">请先点击页面中的剧集链接</p>
+
+      <div id="overlay" class="overlay hidden" aria-live="polite">
+        <div class="overlay-box">
+          <div class="spinner"></div>
+          <span>正在读取剧集列表…</span>
+        </div>
+      </div>
+    </div>
+
+    <script src="../lib/domain.js"></script>
+    <script src="sidebar.js"></script>
+  </body>
+</html>
