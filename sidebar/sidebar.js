@@ -11,6 +11,7 @@ const bootOverlay = document.getElementById("boot-overlay");
 const panel = document.querySelector(".panel");
 
 let suppressSwitchEvent = false;
+let popupClosing = false;
 let loadUiPromise = null;
 let initialBootDone = false;
 
@@ -56,7 +57,7 @@ function render(state) {
   }
 
   episodeCountEl.textContent = String(count);
-  statusMsg.textContent = count > 0 ? "" : "请先点击页面中的剧集链接";
+  statusMsg.textContent = count > 0 ? "" : "无可用列表";
   statusMsg.classList.toggle("hidden", count > 0);
 }
 
@@ -71,6 +72,7 @@ function loadUi() {
     try {
       render(await readStorage());
     } catch (error) {
+      vapLogError("popup", error, { action: "loadUi" });
       console.error("[Videos Auto Play] failed to load popup state", error);
     } finally {
       if (isInitialBoot && bootOverlay) {
@@ -86,19 +88,30 @@ function loadUi() {
 
 async function persistSettings(enabled, domain) {
   const prev = await readStorage();
+
+  if (!enabled) {
+    await browser.storage.local.set({ enabled: false });
+    vapLog.info("plugin", "disabled from popup");
+    return readStorage();
+  }
+
   const nextDomain = normalizeDomain(domain) || prev.domain || "";
+  if (!nextDomain) {
+    return prev;
+  }
 
   const patch = {
-    enabled: Boolean(enabled) && Boolean(nextDomain),
+    enabled: true,
     domain: nextDomain,
   };
 
-  if (patch.enabled && !prev.enabled) {
+  if (!prev.enabled) {
     patch.episodes = [];
     patch.episodeCount = 0;
   }
 
   await browser.storage.local.set(patch);
+  vapLog.info("plugin", "enabled from popup", { domain: nextDomain });
   return readStorage();
 }
 
@@ -108,6 +121,9 @@ async function runScan(task) {
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
   try {
     return await task();
+  } catch (error) {
+    vapLogError("popup", error, { action: "runScan" });
+    throw error;
   } finally {
     const elapsed = Date.now() - startedAt;
     if (elapsed < MIN_OVERLAY_MS) {
@@ -118,11 +134,12 @@ async function runScan(task) {
 }
 
 window.addEventListener("pagehide", () => {
+  popupClosing = true;
   suppressSwitchEvent = true;
 });
 
 enableSwitch.addEventListener("change", async () => {
-  if (suppressSwitchEvent) return;
+  if (suppressSwitchEvent || popupClosing) return;
 
   const enabled = enableSwitch.checked;
   const domain = normalizeDomain(domainInput.value);
@@ -139,14 +156,19 @@ enableSwitch.addEventListener("change", async () => {
 
   if (enabled) {
     await runScan(async () => {
-      await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+      const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+      if (response?.error) {
+        vapLog.warn("scan", "refresh response error", response);
+      }
       render(await readStorage());
+    }).catch((error) => {
+      vapLogError("scan", error, { action: "enable-switch" });
     });
   }
 });
 
 domainInput.addEventListener("keydown", async (event) => {
-  if (event.key !== "Enter") return;
+  if (event.key !== "Enter" || popupClosing) return;
   event.preventDefault();
 
   const domain = normalizeDomain(domainInput.value);
@@ -157,16 +179,26 @@ domainInput.addEventListener("keydown", async (event) => {
 
   if (enableSwitch.checked) {
     await runScan(async () => {
-      await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+      const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+      if (response?.error) {
+        vapLog.warn("scan", "refresh response error", response);
+      }
       render(await readStorage());
+    }).catch((error) => {
+      vapLogError("scan", error, { action: "domain-enter" });
     });
   }
 });
 
 refreshBtn.addEventListener("click", async () => {
   await runScan(async () => {
-    await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+    const response = await browser.runtime.sendMessage({ type: "REFRESH_EPISODES" });
+    if (response?.error) {
+      vapLog.warn("scan", "refresh response error", response);
+    }
     render(await readStorage());
+  }).catch((error) => {
+    vapLogError("scan", error, { action: "refresh-button" });
   });
 });
 

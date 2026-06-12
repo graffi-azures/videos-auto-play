@@ -1,4 +1,4 @@
-/* Episode list from first-clicked sibling anchors + auto play next episode. */
+/* Episode list auto-scan from playlist-class anchors + iframe auto play. */
 
 (() => {
   if (window.__videosAutoPlayLoaded) {
@@ -13,11 +13,52 @@
     playerTarget: "__vapPlayerTarget",
     playerCaptured: "__vapPlayerCaptured",
     autoPlay: "__vapAutoPlay",
-    mirrorEnabled: "__vapMirrorEnabled",
-    mirrorDomain: "__vapMirrorDomain",
   };
 
   const IFRAME_OBSERVER_MAX_MS = 45000;
+
+  const EPISODE_LINK_CLASS_PATTERN =
+    /(?:playlist|play-list|play_list|play-list|ep-?list|eplist|episode|num-?list|serial|series|选集|剧集|分集|集数|ju-?list|sortlist)/i;
+
+  const ACTIVE_TAB_PANEL_SELECTORS = [
+    '[role="tabpanel"][aria-hidden="false"]',
+    ".tab-pane.active",
+    ".tab-pane.show.active",
+    ".tab-pane.show",
+    ".tab-content > .active",
+    ".tab-body > .active",
+    ".tabs-content > .active",
+    '[class*="tab-panel"].active',
+    '[class*="tab-panel"][class*="active"]',
+    '[class*="tabPanel"].active',
+    '[class*="tab-con"].active',
+    '[class*="tabCon"].active',
+  ];
+
+  const TAB_TRIGGER_SELECTORS = [
+    '[role="tab"][aria-selected="true"]',
+    ".nav-tabs .active",
+    ".nav-tabs .show",
+    '[class*="tab-item"].active',
+    '[class*="tab-item"].on',
+    '[class*="tab-item"].cur',
+    '[class*="tabItem"].active',
+    '[class*="tab-btn"].active',
+    '[class*="tab-btn"].on',
+    '[class*="tabBtn"].active',
+    '[class*="tab-nav"] .active',
+    '[class*="tab-nav"] .on',
+    '[class*="tab-nav"] .cur',
+  ];
+
+  const TAB_CONTENT_WRAPPER_SELECTORS = [
+    '[class*="tab-content"]',
+    '[class*="tabContent"]',
+    '[class*="tabs-content"]',
+    '[class*="tab-con"]',
+    '[class*="tabCon"]',
+    '[class*="tab-body"]',
+  ];
 
   function playerPlay() {
     return (
@@ -37,7 +78,11 @@
   let savedClickPoint = null;
   let savedIframeIndex = -1;
   let iframeObserverStopTimer = null;
+  let bootstrapDelayTimer = null;
+  let bootstrapRunId = 0;
   const boundIframes = new WeakSet();
+  let settingsReady = false;
+  let settingsReadyPromise = null;
 
   function tabCaptureStorageKey(tabId) {
     return `vapCapture_${tabId}`;
@@ -104,6 +149,13 @@
     tabStateReady = true;
   }
 
+  function clearBootstrapDelayTimer() {
+    if (bootstrapDelayTimer != null) {
+      clearTimeout(bootstrapDelayTimer);
+      bootstrapDelayTimer = null;
+    }
+  }
+
   function stopAutoPlayRetry() {
     // auto-play retries run in the background service worker
   }
@@ -122,8 +174,8 @@
   async function stopBackgroundEndMonitor() {
     try {
       await browser.runtime.sendMessage({ type: "STOP_END_MONITOR" });
-    } catch {
-      // ignore
+    } catch (error) {
+      vapLogError("end-monitor", error, { action: "stop" });
     }
   }
 
@@ -131,23 +183,39 @@
     if (!isRunning() || !pageHasIframePlayer()) return;
     try {
       await browser.runtime.sendMessage({ type: "START_END_MONITOR" });
-    } catch {
-      // ignore
+      vapLog.info("end-monitor", "started background end monitor");
+    } catch (error) {
+      vapLogError("end-monitor", error, { action: "start" });
     }
   }
 
   async function requestBackgroundAutoPlay() {
     try {
       await browser.runtime.sendMessage({ type: "REQUEST_AUTO_PLAY" });
-    } catch {
-      // ignore
+      vapLog.info("autoplay", "requested background auto play");
+    } catch (error) {
+      vapLogError("autoplay", error, { action: "request" });
     }
   }
 
   function stopAllMonitors() {
+    bootstrapRunId += 1;
     stopAutoPlayRetry();
     stopIframeObserver();
+    clearBootstrapDelayTimer();
     void stopBackgroundEndMonitor();
+  }
+
+  function scheduleBootstrapPlayback(delayMs = 0) {
+    clearBootstrapDelayTimer();
+    const runId = ++bootstrapRunId;
+    bootstrapDelayTimer = setTimeout(() => {
+      bootstrapDelayTimer = null;
+      if (runId !== bootstrapRunId) return;
+      void bootstrapPlayback().catch(() => {
+        stopAllMonitors();
+      });
+    }, delayMs);
   }
 
   function normalizeUrl(url) {
@@ -162,29 +230,221 @@
     return href && !href.startsWith("javascript:") && href !== "#";
   }
 
+  function hasPlaylistClass(element) {
+    if (!(element instanceof Element)) return false;
+    for (const name of element.classList) {
+      if (EPISODE_LINK_CLASS_PATTERN.test(name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isEpisodeAnchor(anchor) {
+    return (
+      anchor instanceof HTMLAnchorElement &&
+      isValidEpisodeHref(anchor.getAttribute("href")) &&
+      hasPlaylistClass(anchor)
+    );
+  }
+
+  function isElementVisible(element) {
+    if (!(element instanceof Element)) return false;
+    if (element.hidden) return false;
+
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") {
+      return false;
+    }
+
+    return element.getClientRects().length > 0;
+  }
+
+  function hasActiveTabClass(element) {
+    if (!(element instanceof Element)) return false;
+    if (element.getAttribute("aria-selected") === "true") return true;
+
+    for (const name of element.classList) {
+      if (/^(active|cur|current|selected|show)$/i.test(name)) return true;
+      if (/^(?:is-)?active$/i.test(name)) return true;
+      if (/^(?:tab-)?on$/i.test(name)) return true;
+      if (/tab.*active|active.*tab/i.test(name)) return true;
+    }
+
+    return false;
+  }
+
+  function countEpisodeAnchors(root) {
+    return [...root.querySelectorAll("a[href]")].filter(isEpisodeAnchor).length;
+  }
+
+  function pickBestTabPanel(candidates) {
+    let best = null;
+    let bestCount = -1;
+
+    for (const panel of candidates) {
+      if (!isElementVisible(panel)) continue;
+      const count = countEpisodeAnchors(panel);
+      if (count > bestCount) {
+        best = panel;
+        bestCount = count;
+      }
+    }
+
+    return best;
+  }
+
+  function resolveTabPanelFromTrigger(trigger) {
+    if (!(trigger instanceof Element)) return null;
+
+    const href = trigger.getAttribute("href");
+    if (href?.startsWith("#") && href.length > 1) {
+      const panel = document.querySelector(href);
+      if (panel instanceof Element) return panel;
+    }
+
+    const controls = trigger.getAttribute("aria-controls");
+    if (controls) {
+      const panel = document.getElementById(controls);
+      if (panel instanceof Element) return panel;
+    }
+
+    const target = trigger.dataset?.target || trigger.dataset?.bsTarget;
+    if (target) {
+      const panel = document.querySelector(target);
+      if (panel instanceof Element) return panel;
+    }
+
+    const nav = trigger.closest('[class*="tab-nav"], [class*="tabNav"], .nav-tabs, ul');
+    const contentRoot = nav?.parentElement;
+    if (!nav || !contentRoot) return null;
+
+    const triggers = [...nav.querySelectorAll("a, [role='tab'], li")].filter(
+      (node) => node instanceof Element
+    );
+    const index = triggers.findIndex(
+      (node) => node === trigger || node.contains(trigger) || trigger.contains(node)
+    );
+    if (index < 0) return null;
+
+    for (const selector of TAB_CONTENT_WRAPPER_SELECTORS) {
+      const wrapper = contentRoot.querySelector(selector);
+      if (!(wrapper instanceof Element)) continue;
+      const panel = wrapper.children[index];
+      if (panel instanceof Element) return panel;
+    }
+
+    return null;
+  }
+
+  function findVisibleTabPanelFromWrappers() {
+    for (const selector of TAB_CONTENT_WRAPPER_SELECTORS) {
+      for (const wrapper of document.querySelectorAll(selector)) {
+        const visibleChildren = [...wrapper.children].filter(isElementVisible);
+        const withEpisodes = visibleChildren.filter((child) => countEpisodeAnchors(child) > 0);
+        if (withEpisodes.length === 0) continue;
+
+        const activeChild = withEpisodes.find(
+          (child) => hasActiveTabClass(child) || child.querySelector(".active, .on, .cur, .current, .selected")
+        );
+        if (activeChild) return activeChild;
+
+        if (withEpisodes.length === 1) return withEpisodes[0];
+        return pickBestTabPanel(withEpisodes);
+      }
+    }
+
+    return null;
+  }
+
+  function findActiveTabPanel() {
+    for (const selector of ACTIVE_TAB_PANEL_SELECTORS) {
+      let matches = [];
+      try {
+        matches = [...document.querySelectorAll(selector)].filter(isElementVisible);
+      } catch {
+        matches = [];
+      }
+
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1) {
+        const activeMatches = matches.filter(hasActiveTabClass);
+        if (activeMatches.length === 1) return activeMatches[0];
+        const picked = pickBestTabPanel(activeMatches.length ? activeMatches : matches);
+        if (picked) return picked;
+      }
+    }
+
+    for (const selector of TAB_TRIGGER_SELECTORS) {
+      let triggers = [];
+      try {
+        triggers = [...document.querySelectorAll(selector)];
+      } catch {
+        triggers = [];
+      }
+
+      for (const trigger of triggers) {
+        const panel = resolveTabPanelFromTrigger(trigger);
+        if (panel instanceof Element && isElementVisible(panel)) {
+          return panel;
+        }
+      }
+    }
+
+    return findVisibleTabPanelFromWrappers();
+  }
+
+  function getEpisodeSearchRoot() {
+    return findActiveTabPanel() || document;
+  }
+
+  function isWithinEpisodeSearchRoot(element, root = getEpisodeSearchRoot()) {
+    if (!(element instanceof Element)) return false;
+    return root === document || root.contains(element);
+  }
+
   function isRunning() {
     return Boolean(enabled && domain);
   }
 
-  function syncMirrorFromState() {
-    sessionSet(SESSION_KEYS.mirrorEnabled, enabled ? "1" : "0");
-    sessionSet(SESSION_KEYS.mirrorDomain, domain || "");
+  function loadPluginSettings(data, options = {}) {
+    enabled = Boolean(data.enabled);
+    domain = data.domain || "";
+    episodes = Array.isArray(data.episodes) ? data.episodes : [];
+
+    if (!enabled) {
+      clearSessionCaptures();
+      stopAllMonitors();
+      return false;
+    }
+
+    if (options.resetCaptures) {
+      clearSessionCaptures();
+      episodes = [];
+    }
+
+    return true;
   }
 
-  function readMirrorToState() {
-    const mirrorEnabled = sessionGet(SESSION_KEYS.mirrorEnabled);
-    const mirrorDomain = sessionGet(SESSION_KEYS.mirrorDomain);
-    if (mirrorEnabled != null) {
-      enabled = mirrorEnabled === "1";
+  async function ensureSettingsLoaded() {
+    if (settingsReady) return;
+    if (settingsReadyPromise) {
+      await settingsReadyPromise;
+      return;
     }
-    if (mirrorDomain != null) {
-      domain = mirrorDomain;
-    }
-  }
 
-  function isRunningFromMirror() {
-    readMirrorToState();
-    return isRunning();
+    settingsReadyPromise = (async () => {
+      const data = await browser.storage.local.get([
+        "enabled",
+        "domain",
+        "episodes",
+        "episodeCount",
+      ]);
+      loadPluginSettings(data);
+      settingsReady = true;
+    })();
+
+    await settingsReadyPromise;
   }
 
   function sessionGet(key) {
@@ -228,10 +488,6 @@
 
   function isEpisodeListCaptured() {
     return sessionGet(SESSION_KEYS.episodeCaptured) === "1";
-  }
-
-  function canCaptureEpisodeList() {
-    return !isEpisodeListCaptured() || episodes.length === 0;
   }
 
   function clearEpisodeListCapture() {
@@ -324,16 +580,20 @@
   }
 
   function getDirectChildAnchors(container) {
-    return [...container.querySelectorAll(":scope > a[href]")].filter((node) =>
-      isValidEpisodeHref(node.getAttribute("href"))
-    );
+    return [...container.querySelectorAll(":scope > a[href]")].filter(isEpisodeAnchor);
   }
 
-  function discoverEpisodeList(anchor) {
+  function getRowItemAnchors(container) {
+    return [...container.querySelectorAll(":scope > * > a[href]")].filter(isEpisodeAnchor);
+  }
+
+  function discoverEpisodeList(anchor, root = getEpisodeSearchRoot()) {
+    if (!isEpisodeAnchor(anchor) || !isWithinEpisodeSearchRoot(anchor, root)) return null;
+
     let best = null;
     let node = anchor.parentElement;
 
-    while (node && node !== document.body) {
+    while (node && node !== document.body && isWithinEpisodeSearchRoot(node, root)) {
       const directAnchors = getDirectChildAnchors(node);
       if (directAnchors.includes(anchor)) {
         const list = anchorsToEpisodes(directAnchors);
@@ -341,20 +601,48 @@
           best = { container: node, mode: "direct", list };
         }
       }
+
+      const rowAnchors = getRowItemAnchors(node);
+      if (rowAnchors.includes(anchor)) {
+        const list = anchorsToEpisodes(rowAnchors);
+        if (list.length > 0 && (!best || list.length > best.list.length)) {
+          best = { container: node, mode: "row-items", list };
+        }
+      }
+
       node = node.parentElement;
     }
 
     return best;
   }
 
+  function discoverEpisodeListAuto() {
+    const root = getEpisodeSearchRoot();
+    const seeds = [...root.querySelectorAll("a[href]")].filter(isEpisodeAnchor);
+    if (seeds.length === 0) return null;
+
+    let best = null;
+    for (const anchor of seeds) {
+      const found = discoverEpisodeList(anchor, root);
+      if (found && found.list.length > 0 && (!best || found.list.length > best.list.length)) {
+        best = found;
+      }
+    }
+
+    return best;
+  }
+
+  function saveEpisodeListCapture(found) {
+    sessionSet(SESSION_KEYS.episodeContainer, JSON.stringify(buildDescriptor(found.container)));
+    sessionSet(SESSION_KEYS.episodeScanMode, found.mode);
+    sessionSet(SESSION_KEYS.episodeCaptured, "1");
+  }
+
   function captureEpisodeList(anchor) {
     const found = discoverEpisodeList(anchor);
     if (!found || found.list.length === 0) return [];
 
-    sessionSet(SESSION_KEYS.episodeContainer, JSON.stringify(buildDescriptor(found.container)));
-    sessionSet(SESSION_KEYS.episodeScanMode, found.mode);
-    sessionSet(SESSION_KEYS.episodeCaptured, "1");
-
+    saveEpisodeListCapture(found);
     return found.list;
   }
 
@@ -362,18 +650,53 @@
     const container = findElementByDescriptor(sessionGet(SESSION_KEYS.episodeContainer));
     if (!container) return [];
 
+    const root = getEpisodeSearchRoot();
+    if (root !== document && !root.contains(container)) {
+      return [];
+    }
+    if (!isElementVisible(container)) {
+      return [];
+    }
+
     const mode = sessionGet(SESSION_KEYS.episodeScanMode) || "direct";
-    const anchors =
-      mode === "row-items"
-        ? [...container.querySelectorAll(":scope > * > a[href]")]
-        : getDirectChildAnchors(container);
+    const anchors = mode === "row-items" ? getRowItemAnchors(container) : getDirectChildAnchors(container);
 
     return anchorsToEpisodes(anchors);
   }
 
-  function scanEpisodes() {
-    if (!isEpisodeListCaptured()) return [];
-    return scanEpisodesFromSavedContainer();
+  function scanEpisodes(options = {}) {
+    if (options.rediscover) {
+      clearEpisodeListCapture();
+    }
+
+    if (isEpisodeListCaptured() && !options.rediscover) {
+      const saved = scanEpisodesFromSavedContainer();
+      if (saved.length > 0) {
+        return saved;
+      }
+    }
+
+    const found = discoverEpisodeListAuto();
+    if (found) {
+      saveEpisodeListCapture(found);
+      return found.list;
+    }
+
+    return [];
+  }
+
+  function autoScanAndPublish(options = {}) {
+    if (!isRunning()) return episodes;
+
+    const list = scanEpisodes(options);
+    if (list.length > 0) {
+      publishEpisodes(list);
+      void maybeStartEndMonitor();
+      vapLog.info("scan", "episode list updated on page", { count: list.length });
+    } else if (options.rediscover) {
+      vapLog.warn("scan", "no episode list found on page");
+    }
+    return list;
   }
 
   function publishEpisodes(list) {
@@ -385,15 +708,7 @@
   }
 
   function rescanAndPublish() {
-    if (!isRunning() || !isEpisodeListCaptured()) return episodes;
-
-    const list = scanEpisodesFromSavedContainer();
-    if (list.length === 0) {
-      return episodes;
-    }
-
-    publishEpisodes(list);
-    return list;
+    return autoScanAndPublish({ rediscover: false });
   }
 
   function buildPlayerClickPoint(event) {
@@ -479,7 +794,7 @@
   }
 
   async function maybeStartEndMonitor() {
-    readMirrorToState();
+    await ensureSettingsLoaded();
     if (!isRunning() || !pageHasIframePlayer() || shouldAutoPlay()) return;
     if (episodes.length === 0) {
       await refreshEpisodesFromStorage();
@@ -571,25 +886,35 @@
   }
 
   async function playNextEpisode() {
-    readMirrorToState();
+    await ensureSettingsLoaded();
     if (!isRunning() || !pageHasIframePlayer()) return;
 
     await refreshEpisodesFromStorage();
     if (episodes.length === 0) return;
 
     const index = findCurrentEpisodeIndex(episodes);
-    if (index < 0 || index >= episodes.length - 1) return;
+    if (index < 0 || index >= episodes.length - 1) {
+      vapLog.warn("autoplay", "cannot play next episode", {
+        index,
+        total: episodes.length,
+        current: location.href,
+      });
+      return;
+    }
 
     const nextUrl = episodes[index + 1].url;
+    vapLog.info("autoplay", "navigating to next episode", { index: index + 1, nextUrl });
     await stopBackgroundEndMonitor();
     await markAutoPlayPending(nextUrl);
     location.href = nextUrl;
   }
 
   function startAutoPlayRetry() {
-    readMirrorToState();
-    if (!isRunning() || !shouldAutoPlay() || !pageHasIframePlayer()) return;
-    void requestBackgroundAutoPlay();
+    void (async () => {
+      await ensureSettingsLoaded();
+      if (!isRunning() || !shouldAutoPlay() || !pageHasIframePlayer()) return;
+      void requestBackgroundAutoPlay();
+    })();
   }
 
   function bindIframe(frame) {
@@ -603,11 +928,14 @@
   }
 
   function observeIframesForAutoPlay() {
-    if (!shouldAutoPlay()) return;
+    if (!shouldAutoPlay()) {
+      stopIframeObserver();
+      return;
+    }
 
     playerPlay().findLargeIframes().forEach(bindIframe);
 
-    if (window.__vapIframeObserver) return;
+    stopIframeObserver();
     window.__vapIframeObserver = new MutationObserver(() => {
       if (!shouldAutoPlay()) {
         stopIframeObserver();
@@ -627,29 +955,35 @@
   }
 
   function handleEpisodeCapture(event) {
-    if (!isRunningFromMirror() || !canCaptureEpisodeList()) return;
+    void (async () => {
+      await ensureSettingsLoaded();
+      if (!isRunning()) return;
 
     const target = event.target;
     if (!(target instanceof Element)) return;
 
     const anchor = target.closest("a[href]");
-    if (!anchor || !isValidEpisodeHref(anchor.getAttribute("href"))) return;
+    if (!isEpisodeAnchor(anchor)) return;
 
     const list = captureEpisodeList(anchor);
     if (list.length > 0) {
       publishEpisodes(list);
       void maybeStartEndMonitor();
     }
+    })();
   }
 
   function handlePlayerCapture(event) {
-    if (!isRunningFromMirror()) return;
+    void (async () => {
+      await ensureSettingsLoaded();
+      if (!isRunning()) return;
 
     const target = event.target;
     if (!(target instanceof Element)) return;
     if (!isPlayerRelatedElement(target)) return;
 
     savePlayerTarget(target, event);
+    })();
   }
 
   function setupClickCapture() {
@@ -664,48 +998,52 @@
   }
 
   async function bootstrapPlayback() {
-    if (!tabStateReady) {
-      await restoreTabState();
+    try {
+      await ensureSettingsLoaded();
+      if (!tabStateReady) {
+        await restoreTabState();
+      }
+
+      if (!isRunning()) return;
+
+      autoScanAndPublish({ rediscover: false });
+
+      if (!pageHasIframePlayer()) {
+        return;
+      }
+
+      if (shouldAutoPlay()) {
+        observeIframesForAutoPlay();
+        startAutoPlayRetry();
+        return;
+      }
+
+      void maybeStartEndMonitor();
+    } catch (error) {
+      vapLogError("bootstrap", error);
+      stopAllMonitors();
     }
-
-    readMirrorToState();
-    if (!isRunning()) return;
-
-    rescanAndPublish();
-
-    if (!pageHasIframePlayer()) {
-      return;
-    }
-
-    if (shouldAutoPlay()) {
-      observeIframesForAutoPlay();
-      startAutoPlayRetry();
-      return;
-    }
-
-    void maybeStartEndMonitor();
   }
 
   function applyStorage(data, options = {}) {
-    enabled = Boolean(data.enabled);
-    domain = data.domain || "";
-    episodes = Array.isArray(data.episodes) ? data.episodes : [];
-
-    if (!enabled) {
-      clearSessionCaptures();
-      stopAllMonitors();
-      syncMirrorFromState();
+    settingsReady = true;
+    const wasEnabled = enabled;
+    const active = loadPluginSettings(data, options);
+    if (!active) {
+      if (wasEnabled || data.enabled === false) {
+        vapLog.info("plugin", "plugin inactive on page", { enabled: false, domain: data.domain || "" });
+      }
       return;
     }
 
     if (options.resetCaptures) {
-      clearSessionCaptures();
-      episodes = [];
+      vapLog.info("plugin", "plugin enabled, captures reset");
+    } else if (!wasEnabled && enabled) {
+      vapLog.info("plugin", "plugin active on page", { domain });
     }
 
-    syncMirrorFromState();
     setupClickCapture();
-    bootstrapPlayback();
+    void bootstrapPlayback();
   }
 
   browser.storage.onChanged.addListener((changes, areaName) => {
@@ -719,9 +1057,6 @@
       .get(["enabled", "domain", "episodes", "episodeCount"])
       .then((data) => {
         applyStorage(data, { resetCaptures });
-        if (Boolean(data.enabled) && data.domain) {
-          bootstrapPlayback();
-        }
       });
   });
 
@@ -731,20 +1066,23 @@
         sendResponse({ ok: true });
         break;
       case "SCAN_EPISODES": {
-        const list = scanEpisodes();
+        const list = scanEpisodes({ rediscover: Boolean(message.rediscover) });
         if (list.length > 0) {
           publishEpisodes(list);
+          void maybeStartEndMonitor();
         }
         sendResponse({ episodes: list, episodeCount: list.length });
         break;
       }
       case "AUTO_PLAY_NOW":
-        readMirrorToState();
-        if (isRunning() && shouldAutoPlay() && pageHasIframePlayer()) {
-          observeIframesForAutoPlay();
-          startAutoPlayRetry();
-        }
-        sendResponse({ playing: false });
+        void (async () => {
+          await ensureSettingsLoaded();
+          if (isRunning() && shouldAutoPlay() && pageHasIframePlayer()) {
+            observeIframesForAutoPlay();
+            startAutoPlayRetry();
+          }
+          sendResponse({ playing: false });
+        })();
         break;
       case "AUTO_PLAY_SUCCEEDED":
         void clearAutoPlayPending();
@@ -771,29 +1109,36 @@
   });
 
   async function initExtension() {
-    await restoreTabState();
-    const data = await browser.storage.local.get([
-      "enabled",
-      "domain",
-      "episodes",
-      "episodeCount",
-    ]);
-    applyStorage(data);
+    try {
+      await restoreTabState();
+      await ensureSettingsLoaded();
+      if (isRunning()) {
+        setupClickCapture();
+      }
+    } catch (error) {
+      vapLogError("init", error);
+      stopAllMonitors();
+    }
   }
 
   void initExtension();
 
   window.addEventListener("pageshow", () => {
     void (async () => {
-      await restoreTabState();
-      const data = await browser.storage.local.get([
-        "enabled",
-        "domain",
-        "episodes",
-        "episodeCount",
-      ]);
-      applyStorage(data);
-      await bootstrapPlayback();
+      stopAllMonitors();
+      try {
+        await restoreTabState();
+        settingsReady = false;
+        settingsReadyPromise = null;
+        await ensureSettingsLoaded();
+        if (isRunning()) {
+          setupClickCapture();
+          await bootstrapPlayback();
+        }
+      } catch (error) {
+        vapLogError("page", error, { phase: "pageshow" });
+        stopAllMonitors();
+      }
     })();
   });
 
@@ -801,13 +1146,15 @@
     stopAllMonitors();
   });
 
+  window.addEventListener("beforeunload", () => {
+    stopAllMonitors();
+  });
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
-      void bootstrapPlayback();
+      scheduleBootstrapPlayback(0);
     });
   } else {
-    setTimeout(() => {
-      void bootstrapPlayback();
-    }, 300);
+    scheduleBootstrapPlayback(300);
   }
 })();

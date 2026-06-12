@@ -1,4 +1,4 @@
-importScripts("lib/domain.js");
+importScripts("lib/domain.js", "lib/logger.js");
 
 const autoPlayJobs = new Map();
 const endMonitors = new Map();
@@ -62,25 +62,43 @@ async function ensureContentScript(tabId) {
 
   const tab = await browser.tabs.get(tabId).catch(() => null);
   if (!tab?.url || tab.url.startsWith("about:") || tab.url.startsWith("moz-extension:")) {
+    void vapLog.warn("content-script", "cannot inject on restricted page", { url: tab?.url }, { tabId });
     return false;
   }
 
   try {
     await browser.scripting.executeScript({
       target: { tabId },
-      files: ["lib/domain.js", "lib/player-play.js", "content/content.js"],
+      files: ["lib/domain.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
     });
-  } catch {
+  } catch (error) {
+    void vapLogError("content-script", error, { action: "inject" }, { tabId, url: tab.url });
     return false;
   }
 
-  return Boolean((await sendToTab(tabId, { type: "PING" }))?.ok);
+  const ok = Boolean((await sendToTab(tabId, { type: "PING" }))?.ok);
+  if (!ok) {
+    void vapLog.warn("content-script", "injected but PING failed", null, { tabId, url: tab.url });
+  }
+  return ok;
 }
 
-async function requestScan(tabId) {
-  await ensureContentScript(tabId);
-  const response = await sendToTab(tabId, { type: "SCAN_EPISODES" });
-  return response?.episodes || [];
+async function requestScan(tabId, rediscover = false) {
+  try {
+    await ensureContentScript(tabId);
+    const response = await sendToTab(tabId, { type: "SCAN_EPISODES", rediscover });
+    const episodes = response?.episodes || [];
+    void vapLog.info(
+      "scan",
+      rediscover ? "manual scan finished" : "scan finished",
+      { count: episodes.length, rediscover },
+      { tabId }
+    );
+    return episodes;
+  } catch (error) {
+    void vapLogError("scan", error, { rediscover }, { tabId });
+    return [];
+  }
 }
 
 function autoPlayKey(tabId) {
@@ -98,11 +116,11 @@ async function getAutoPlayState(tabId) {
 
 function cancelAutoPlayJob(tabId) {
   const job = autoPlayJobs.get(tabId);
-  if (job) {
-    job.cancel = true;
-    if (job.timer != null) {
-      clearTimeout(job.timer);
-    }
+  if (!job) return;
+  job.cancel = true;
+  if (job.timer != null) {
+    clearTimeout(job.timer);
+    job.timer = null;
   }
   autoPlayJobs.delete(tabId);
 }
@@ -113,6 +131,7 @@ function stopEndMonitor(tabId) {
   monitor.cancel = true;
   if (monitor.timer != null) {
     clearInterval(monitor.timer);
+    monitor.timer = null;
   }
   endMonitors.delete(tabId);
 }
@@ -120,6 +139,25 @@ function stopEndMonitor(tabId) {
 function stopAllTabJobs(tabId) {
   cancelAutoPlayJob(tabId);
   stopEndMonitor(tabId);
+}
+
+function stopAllBackgroundJobs() {
+  for (const tabId of [...autoPlayJobs.keys()]) {
+    cancelAutoPlayJob(tabId);
+  }
+  for (const tabId of [...endMonitors.keys()]) {
+    stopEndMonitor(tabId);
+  }
+}
+
+function scheduleAutoPlayTimer(job, callback, delayMs) {
+  if (job.timer != null) {
+    clearTimeout(job.timer);
+  }
+  job.timer = setTimeout(() => {
+    job.timer = null;
+    void callback();
+  }, delayMs);
 }
 
 async function clearAutoPlayState(tabId) {
@@ -162,7 +200,8 @@ async function clickIframePlayer(tabId, capture) {
     });
 
     return Boolean(results?.[0]?.result);
-  } catch {
+  } catch (error) {
+    void vapLogError("autoplay", error, { action: "click-iframe" }, { tabId });
     return false;
   }
 }
@@ -181,45 +220,68 @@ async function triggerAutoPlayForTab(tabId) {
 
   let attempt = 0;
 
-  const runAttempt = async () => {
+  const finishAutoPlay = async (messageType) => {
     if (job.cancel) return;
-    if (!(await tabExists(tabId))) {
-      await clearAutoPlayState(tabId);
-      cancelAutoPlayJob(tabId);
-      return;
+    cancelAutoPlayJob(tabId);
+    await browser.storage.local.remove(autoPlayKey(tabId)).catch(() => {});
+    if (messageType === "AUTO_PLAY_SUCCEEDED") {
+      void vapLog.info("autoplay", "iframe auto play succeeded", { attempts: attempt + 1 }, { tabId });
+    } else if (messageType === "AUTO_PLAY_FAILED") {
+      void vapLog.warn("autoplay", "iframe auto play failed", { attempts: attempt }, { tabId });
     }
-
-    const pending = await getAutoPlayState(tabId);
-    if (!pending?.pending) {
-      cancelAutoPlayJob(tabId);
-      return;
+    if (messageType) {
+      await sendToTab(tabId, { type: messageType }).catch((error) => {
+        void vapLogError("autoplay", error, { messageType }, { tabId });
+      });
     }
+  };
 
-    await clickIframePlayer(tabId, capture);
-
-    job.timer = setTimeout(async () => {
+  const runAttempt = async () => {
+    try {
       if (job.cancel) return;
-
-      if (await isTabAudible(tabId)) {
-        await browser.storage.local.remove(autoPlayKey(tabId));
-        await sendToTab(tabId, { type: "AUTO_PLAY_SUCCEEDED" });
+      if (!(await tabExists(tabId))) {
+        await clearAutoPlayState(tabId);
         cancelAutoPlayJob(tabId);
         return;
       }
 
-      attempt += 1;
-      if (attempt >= AUTO_PLAY_ATTEMPTS) {
-        await browser.storage.local.remove(autoPlayKey(tabId));
+      const pending = await getAutoPlayState(tabId);
+      if (!pending?.pending) {
         cancelAutoPlayJob(tabId);
-        await sendToTab(tabId, { type: "AUTO_PLAY_FAILED" });
         return;
       }
 
-      void runAttempt();
-    }, AUTO_PLAY_INTERVAL_MS);
+      await clickIframePlayer(tabId, capture);
+
+      scheduleAutoPlayTimer(job, async () => {
+        try {
+          if (job.cancel) return;
+
+          if (await isTabAudible(tabId)) {
+            await finishAutoPlay("AUTO_PLAY_SUCCEEDED");
+            return;
+          }
+
+          attempt += 1;
+          if (attempt >= AUTO_PLAY_ATTEMPTS) {
+            await finishAutoPlay("AUTO_PLAY_FAILED");
+            return;
+          }
+
+          await runAttempt();
+        } catch (error) {
+          void vapLogError("autoplay", error, { phase: "scheduled-attempt" }, { tabId });
+          await finishAutoPlay("AUTO_PLAY_FAILED");
+        }
+      }, AUTO_PLAY_INTERVAL_MS);
+    } catch (error) {
+      void vapLogError("autoplay", error, { phase: "run-attempt" }, { tabId });
+      await finishAutoPlay("AUTO_PLAY_FAILED");
+    }
   };
 
   void runAttempt();
+  void vapLog.info("autoplay", "auto play job started", null, { tabId });
 }
 
 async function startEndMonitor(tabId) {
@@ -249,38 +311,46 @@ async function startEndMonitor(tabId) {
   endMonitors.set(tabId, monitor);
 
   const tick = async () => {
-    if (monitor.cancel) return;
-    if (!(await tabExists(tabId))) {
+    try {
+      if (monitor.cancel) return;
+      if (!(await tabExists(tabId))) {
+        stopEndMonitor(tabId);
+        return;
+      }
+
+      const enabledNow = await getState();
+      if (!enabledNow.enabled) {
+        stopEndMonitor(tabId);
+        return;
+      }
+
+      const pending = await getAutoPlayState(tabId);
+      if (pending?.pending) return;
+
+      const audible = await isTabAudible(tabId);
+      const now = Date.now();
+
+      if (audible) {
+        monitor.wasAudible = true;
+        monitor.audibleSince = now;
+        monitor.silentChecks = 0;
+        return;
+      }
+
+      if (!monitor.wasAudible) return;
+
+      monitor.silentChecks += 1;
+      const playedMs = now - monitor.audibleSince;
+      if (playedMs >= END_MIN_PLAY_MS && monitor.silentChecks >= END_SILENT_CHECKS) {
+        stopEndMonitor(tabId);
+        void vapLog.info("end-monitor", "episode ended, play next", { playedMs }, { tabId });
+        await sendToTab(tabId, { type: "PLAY_NEXT_EPISODE" }).catch((error) => {
+          void vapLogError("end-monitor", error, { action: "play-next" }, { tabId });
+        });
+      }
+    } catch (error) {
+      void vapLogError("end-monitor", error, { phase: "tick" }, { tabId });
       stopEndMonitor(tabId);
-      return;
-    }
-
-    const enabledNow = await getState();
-    if (!enabledNow.enabled) {
-      stopEndMonitor(tabId);
-      return;
-    }
-
-    const pending = await getAutoPlayState(tabId);
-    if (pending?.pending) return;
-
-    const audible = await isTabAudible(tabId);
-    const now = Date.now();
-
-    if (audible) {
-      monitor.wasAudible = true;
-      monitor.audibleSince = now;
-      monitor.silentChecks = 0;
-      return;
-    }
-
-    if (!monitor.wasAudible) return;
-
-    monitor.silentChecks += 1;
-    const playedMs = now - monitor.audibleSince;
-    if (playedMs >= END_MIN_PLAY_MS && monitor.silentChecks >= END_SILENT_CHECKS) {
-      stopEndMonitor(tabId);
-      await sendToTab(tabId, { type: "PLAY_NEXT_EPISODE" });
     }
   };
 
@@ -293,7 +363,12 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
     if (changeInfo.status === "complete") {
       const state = await getAutoPlayState(tabId);
       if (state?.pending) {
-        await triggerAutoPlayForTab(tabId);
+        try {
+          await triggerAutoPlayForTab(tabId);
+        } catch (error) {
+          void vapLogError("autoplay", error, { phase: "tab-complete" }, { tabId });
+          cancelAutoPlayJob(tabId);
+        }
       }
     }
 
@@ -301,20 +376,29 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       const monitor = endMonitors.get(tabId);
       if (monitor?.wasAudible) {
         void (async () => {
-          const pending = await getAutoPlayState(tabId);
-          if (!pending?.pending) {
-            const now = Date.now();
-            monitor.silentChecks += 1;
-            const playedMs = now - monitor.audibleSince;
-            if (playedMs >= END_MIN_PLAY_MS && monitor.silentChecks >= END_SILENT_CHECKS) {
-              stopEndMonitor(tabId);
-              await sendToTab(tabId, { type: "PLAY_NEXT_EPISODE" });
+          try {
+            if (monitor.cancel) return;
+            const pending = await getAutoPlayState(tabId);
+            if (!pending?.pending) {
+              const now = Date.now();
+              monitor.silentChecks += 1;
+              const playedMs = now - monitor.audibleSince;
+              if (playedMs >= END_MIN_PLAY_MS && monitor.silentChecks >= END_SILENT_CHECKS) {
+                stopEndMonitor(tabId);
+                await sendToTab(tabId, { type: "PLAY_NEXT_EPISODE" });
+              }
             }
+          } catch (error) {
+            void vapLogError("end-monitor", error, { phase: "audible-change" }, { tabId });
+            stopEndMonitor(tabId);
           }
         })();
       }
     }
-  })();
+  })().catch((error) => {
+    void vapLogError("tabs", error, { phase: "onUpdated" }, { tabId });
+    stopAllTabJobs(tabId);
+  });
 });
 
 browser.tabs.onRemoved.addListener((tabId) => {
@@ -325,13 +409,23 @@ browser.tabs.onRemoved.addListener((tabId) => {
 
 if (browser.runtime.onSuspend) {
   browser.runtime.onSuspend.addListener(() => {
-    for (const tabId of [...autoPlayJobs.keys(), ...endMonitors.keys()]) {
-      stopAllTabJobs(tabId);
-    }
+    stopAllBackgroundJobs();
   });
 }
 
 browser.runtime.onStartup.addListener(() => {
+  stopAllBackgroundJobs();
+  void vapLog.info("lifecycle", "browser startup, plugin state reset");
+
+  browser.storage.local
+    .set({
+      enabled: false,
+      domain: "",
+      episodes: [],
+      episodeCount: 0,
+    })
+    .catch(() => {});
+
   browser.storage.local.get(null).then((all) => {
     const keys = Object.keys(all).filter(
       (key) => key.startsWith("vapAutoPlay_") || key.startsWith("vapCapture_")
@@ -345,12 +439,10 @@ browser.runtime.onStartup.addListener(() => {
 browser.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local" || !changes.enabled) return;
   if (changes.enabled.newValue === false) {
-    for (const tabId of [...endMonitors.keys()]) {
-      stopEndMonitor(tabId);
-    }
-    for (const tabId of [...autoPlayJobs.keys()]) {
-      cancelAutoPlayJob(tabId);
-    }
+    stopAllBackgroundJobs();
+    void vapLog.info("plugin", "disabled by storage change");
+  } else if (changes.enabled.newValue === true) {
+    void vapLog.info("plugin", "enabled by storage change");
   }
 });
 
@@ -366,10 +458,11 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "REFRESH_EPISODES": {
           const tab = await getActiveTab(message);
           if (!tab?.id) {
+            void vapLog.warn("scan", "refresh failed: no active tab");
             sendResponse({ ok: false, ...(await getState()) });
             break;
           }
-          const episodes = await requestScan(tab.id);
+          const episodes = await requestScan(tab.id, true);
           await saveEpisodes(episodes, tab.id);
           sendResponse({ ok: true, ...(await getState()) });
           break;
@@ -440,10 +533,17 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
+        case "VAP_LOG": {
+          await handleVapLogMessage(message, sender);
+          sendResponse({ ok: true });
+          break;
+        }
+
         default:
           sendResponse({ error: "unknown_message" });
       }
     } catch (error) {
+      void vapLogError("message", error, { type: message.type });
       sendResponse({ error: String(error) });
     }
   })();

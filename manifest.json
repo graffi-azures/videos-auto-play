@@ -3,7 +3,7 @@
   "name": "Videos Auto Play",
   "version": "1.0.0",
   "description": "自动读取网页剧集列表并在播放结束后连播下一集",
-  "permissions": ["tabs", "storage", "scripting"],
+  "permissions": ["tabs", "storage", "scripting", "downloads"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "scripts": ["background.js"]
@@ -20,7 +20,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["lib/domain.js", "lib/player-play.js", "content/content.js"],
+      "js": ["lib/domain.js", "lib/player-play.js", "lib/log-client.js", "content/content.js"],
       "run_at": "document_idle"
     }
   ],
